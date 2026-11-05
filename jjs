@@ -1,0 +1,1114 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local TextChatService = game:GetService("TextChatService")
+local ContextActionService = game:GetService("ContextActionService")
+
+local localPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+--------------------------------------------------------------------------------
+-- CONFIGURATION SETTINGS
+--------------------------------------------------------------------------------
+local FLY_TOGGLE_KEY = Enum.KeyCode.T      -- Press T to toggle Free Flight
+local ORBIT_TOGGLE_KEY = Enum.KeyCode.N    -- Press N to toggle Orbit Spin
+local TARGET_KEY = Enum.KeyCode.V          -- Press V to Lock / Unlock Target
+local CAM_LOCK_KEY = Enum.KeyCode.Unknown  -- Default set to NONE
+local GO_UP_KEY = Enum.KeyCode.J           -- Orbit Elevation UP
+local GO_DOWN_KEY = Enum.KeyCode.K         -- Orbit Elevation DOWN
+
+-- Flip Keybinds
+local FrontflipKey = Enum.KeyCode.Z
+local BackflipKey = Enum.KeyCode.X
+
+local FLY_SPEED = 150                      -- Free flight speed
+local FLY_START_HEIGHT = 15                -- Initial upward boost
+local ORBIT_RADIUS = 6                     -- Distance from target (studs)
+local ORBIT_SPEED = 120                    -- Spin rate speed
+local HEIGHT_STEP = 5                      -- Orbit height step
+local MAX_HEIGHT = 50                      -- Max orbit altitude limit
+local MIN_HEIGHT = -10                     -- Min orbit altitude limit
+local MAX_CAM_LOCK_DISTANCE = 300          -- Max distance for camera lock
+
+local AUTO_SPECTATE_DEFAULT = true         
+local SPECTATE_ON_ORBIT_ONLY = true        
+local UPSIDE_DOWN_DEFAULT = false          
+local TWEEN_ON_DEATH_DEFAULT = false       
+local RELOCK_ON_RESPAWN_DEFAULT = false    
+local INSTANT_TARGET_ON_ORBIT = false      
+local BACKFLIP_MODE_DEFAULT = false        
+
+-- ESP Settings
+local ESP_SETTINGS = {
+    enabled = false,                       
+    mode = "All",                          
+    defaultcolor = Color3.fromRGB(255, 25, 25),
+    allycolor = Color3.fromRGB(25, 255, 25),
+    teamcheck = false,
+    teamcolor = true,
+    showhealth = true,
+    showname = true,
+    maxdistance = 3000
+}
+
+local CAMERA_MODE = "Instant"
+local CAMERA_DELAY_SPEED = 8               
+
+-- Authorized Owners / Admins
+local authorizedOwners = {
+    ["arisohl"] = true,
+    ["friedchickndevourer"] = true
+}
+--------------------------------------------------------------------------------
+
+local isScriptActive = true                
+local isAdmin = authorizedOwners[localPlayer.Name:lower()] or false
+
+local isFlying = false
+local flyBodyVelocity = nil
+local flyBodyGyro = nil
+local flyConnection = nil
+local noclipConnection = nil
+local isNoclipping = false
+local isFlinging = false
+
+local currentTarget = nil
+local relockOnRespawn = RELOCK_ON_RESPAWN_DEFAULT
+local isOrbiting = false             
+local autoSpectate = AUTO_SPECTATE_DEFAULT
+local isUpsideDown = UPSIDE_DOWN_DEFAULT
+local tweenOnTargetDeath = TWEEN_ON_DEATH_DEFAULT
+local backflipModeActive = BACKFLIP_MODE_DEFAULT
+
+local isCamLocked = false
+local camLockConnection = nil
+local isBindingCamLockKey = false
+
+local angle = 0
+local verticalOffset = 0
+local orbitConnection = nil
+
+local smoothedCameraCFrame = camera.CFrame
+local h = 0.0174533
+
+local newVector2, newColor3, newDrawing = Vector2.new, Color3.new, Drawing.new
+
+--------------------------------------------------------------------------------
+-- ADMIN NETWORK & EXPANDED REMOTE COMMAND PROCESSOR
+--------------------------------------------------------------------------------
+local function processAdminCommand(senderName, msg)
+    if not authorizedOwners[senderName:lower()] then return end
+    
+    local lowerMsg = msg:lower()
+    local prefix = "cmd:" .. localPlayer.Name:lower() .. ":"
+    local allPrefix = "cmd:all:"
+
+    if lowerMsg:find(prefix) or lowerMsg:find(allPrefix) then
+        if lowerMsg:find("kill") then
+            isScriptActive = false
+            pcall(function() script:Destroy() end)
+        elseif lowerMsg:find("fly_on") then
+            if not isFlying then startFlying() end
+        elseif lowerMsg:find("fly_off") then
+            if isFlying then stopFlight() end
+        elseif lowerMsg:find("orbit_on") then
+            if not isOrbiting then startOrbiting() end
+        elseif lowerMsg:find("orbit_off") then
+            if isOrbiting then stopOrbiting(false) end
+        elseif lowerMsg:find("speed:") then
+            local speedVal = tonumber(lowerMsg:match("speed:(%d+)"))
+            if speedVal then 
+                FLY_SPEED = speedVal 
+                local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+                if hum then hum.WalkSpeed = speedVal end
+            end
+        elseif lowerMsg:find("jumppower:") then
+            local jpVal = tonumber(lowerMsg:match("jumppower:(%d+)"))
+            local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if jpVal and hum then hum.JumpPower = jpVal end
+        elseif lowerMsg:find("gravity:") then
+            local gravVal = tonumber(lowerMsg:match("gravity:(%d+)"))
+            if gravVal then workspace.Gravity = gravVal end
+        elseif lowerMsg:find("flip_front") then
+            doFrontflip()
+        elseif lowerMsg:find("flip_back") then
+            doBackflip()
+        elseif lowerMsg:find("sit") then
+            local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then hum.Sit = true end
+        elseif lowerMsg:find("unsit") then
+            local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if hum then hum.Sit = false end
+        elseif lowerMsg:find("noclip_on") then
+            isNoclipping = true
+            if not noclipConnection then
+                noclipConnection = RunService.Stepped:Connect(function()
+                    if not isNoclipping then return end
+                    local char = localPlayer.Character
+                    if char then
+                        for _, part in ipairs(char:GetDescendants()) do
+                            if part:IsA("BasePart") then part.CanCollide = false end
+                        end
+                    end
+                end)
+            end
+        elseif lowerMsg:find("noclip_off") then
+            isNoclipping = false
+            if noclipConnection then noclipConnection:Disconnect() noclipConnection = nil end
+        elseif lowerMsg:find("invisible_on") then
+            local char = localPlayer.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") or part:IsA("Decal") then part.Transparency = 1 end
+                end
+            end
+        elseif lowerMsg:find("invisible_off") then
+            local char = localPlayer.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then part.Transparency = 0 end
+                end
+            end
+        elseif lowerMsg:find("fling_on") then
+            isFlinging = true
+            task.spawn(function()
+                local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+                while isFlinging and hrp do
+                    hrp.RotVelocity = Vector3.new(99999, 99999, 99999)
+                    task.wait()
+                end
+            end)
+        elseif lowerMsg:find("fling_off") then
+            isFlinging = false
+        elseif lowerMsg:find("chat:") then
+            local chatText = msg:match("chat:(.+)")
+            if chatText then
+                pcall(function()
+                    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+                        TextChatService.TextChannels.RBXGeneral:SendAsync(chatText)
+                    end
+                end)
+            end
+        end
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    p.Chatted:Connect(function(msg) processAdminCommand(p.Name, msg) end)
+end
+Players.PlayerAdded:Connect(function(newP)
+    newP.Chatted:Connect(function(msg) processAdminCommand(newP.Name, msg) end)
+end)
+
+pcall(function()
+    if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+        TextChatService.MessageReceived:Connect(function(textChatMessage)
+            if textChatMessage.TextSource then
+                local speaker = Players:GetPlayerByUserId(textChatMessage.TextSource.UserId)
+                if speaker then processAdminCommand(speaker.Name, textChatMessage.Text) end
+            end
+        end)
+    end
+end)
+
+local function sendAdminSignal(commandText)
+    if not isAdmin then return end
+    pcall(function()
+        if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+            local channel = TextChatService.TextChannels.RBXGeneral
+            if channel then channel:SendAsync(commandText) end
+        else
+            game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+                :FindFirstChild("SayMessageRequest"):FireServer(commandText, "All")
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- FLIP FUNCTIONS
+--------------------------------------------------------------------------------
+function doFrontflip()
+    local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hum and hrp then
+        hum:ChangeState("Jumping")
+        task.wait()
+        hum.Sit = true
+        for i = 1, 360 do 
+            task.delay(i / 720, function()
+                if hum then hum.Sit = true end
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.Angles(-h, 0, 0) end
+            end)
+        end
+        task.wait(0.55)
+        if hum then hum.Sit = false end
+    end
+end
+
+function doBackflip()
+    local hum = localPlayer.Character and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+    local hrp = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if hum and hrp then
+        hum:ChangeState("Jumping")
+        task.wait()
+        hum.Sit = true
+        for i = 1, 360 do
+            task.delay(i / 720, function()
+                if hum then hum.Sit = true end
+                if hrp then hrp.CFrame = hrp.CFrame * CFrame.Angles(h, 0, 0) end
+            end)
+        end
+        task.wait(0.55)
+        if hum then hum.Sit = false end
+    end
+end
+
+ContextActionService:BindAction("zeezyFrontflip", function(_, state) if state == Enum.UserInputState.Begin then doFrontflip() end end, false, FrontflipKey)
+ContextActionService:BindAction("zeezyBackflip", function(_, state) if state == Enum.UserInputState.Begin then doBackflip() end end, false, BackflipKey)
+
+local lastJumpTick = 0
+RunService.RenderStepped:Connect(function()
+    if not backflipModeActive or not isScriptActive then return end
+    local character = localPlayer.Character
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if hum and hum:GetState() == Enum.HumanoidStateType.Jumping then
+        local now = tick()
+        if now - lastJumpTick > 0.8 then
+            lastJumpTick = now
+            doBackflip()
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- USER INTERFACE SETUP WITH FOLDABLE SECTIONS
+--------------------------------------------------------------------------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "OmniAllInOneGUI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 360, 0, 710)
+mainFrame.Position = UDim2.new(0, 30, 0.5, -355)
+mainFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+mainFrame.BackgroundTransparency = 0.35
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -20, 0, 25)
+statusLabel.Position = UDim2.new(0, 10, 0, 10)
+statusLabel.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+statusLabel.BackgroundTransparency = 0.4
+statusLabel.TextColor3 = Color3.fromRGB(0, 255, 180)
+statusLabel.TextSize = 12
+statusLabel.Font = Enum.Font.SourceSansBold
+statusLabel.Text = "Locked Target: None"
+statusLabel.Parent = mainFrame
+Instance.new("UICorner", statusLabel).CornerRadius = UDim.new(0, 4)
+
+local function makeCollapsibleSection(name, posY, heightOpen)
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, -20, 0, 22)
+    header.Position = UDim2.new(0, 10, 0, posY)
+    header.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    header.BackgroundTransparency = 0.3
+    header.TextColor3 = Color3.fromRGB(220, 220, 220)
+    header.TextSize = 11
+    header.Font = Enum.Font.SourceSansBold
+    header.Text = "[ - ] " .. name
+    header.Parent = mainFrame
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 4)
+
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, heightOpen)
+    container.Position = UDim2.new(0, 0, 0, 25)
+    container.BackgroundTransparency = 1
+    container.Parent = header
+
+    local isOpen = true
+    header.MouseButton1Click:Connect(function()
+        isOpen = not isOpen
+        container.Visible = isOpen
+        header.Text = (isOpen and "[ - ] " or "[ + ] ") .. name
+    end)
+
+    return container
+end
+
+-- Section 1: Core Automation Controls
+local sec1 = makeCollapsibleSection("Core Controls & Settings", 42, 260)
+
+local flyButton = Instance.new("TextButton")
+flyButton.Size = UDim2.new(0, 160, 0, 28) flyButton.Position = UDim2.new(0, 0, 0, 0)
+flyButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50) flyButton.BackgroundTransparency = 0.2
+flyButton.TextColor3 = Color3.fromRGB(255, 255, 255) flyButton.TextSize = 12 flyButton.Font = Enum.Font.SourceSansBold
+flyButton.Text = "Flight: OFF (T)" flyButton.Parent = sec1
+Instance.new("UICorner", flyButton).CornerRadius = UDim.new(0, 4)
+
+local orbitButton = Instance.new("TextButton")
+orbitButton.Size = UDim2.new(0, 160, 0, 28) orbitButton.Position = UDim2.new(0, 170, 0, 0)
+orbitButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50) orbitButton.BackgroundTransparency = 0.2
+orbitButton.TextColor3 = Color3.fromRGB(255, 255, 255) orbitButton.TextSize = 12 orbitButton.Font = Enum.Font.SourceSansBold
+orbitButton.Text = "Orbit: OFF (N)" orbitButton.Parent = sec1
+Instance.new("UICorner", orbitButton).CornerRadius = UDim.new(0, 4)
+
+local spectateButton = Instance.new("TextButton")
+spectateButton.Size = UDim2.new(0, 160, 0, 28) spectateButton.Position = UDim2.new(0, 0, 0, 32)
+spectateButton.BackgroundColor3 = autoSpectate and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+spectateButton.BackgroundTransparency = 0.2 spectateButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+spectateButton.TextSize = 12 spectateButton.Font = Enum.Font.SourceSansBold
+spectateButton.Text = "Spectate: " .. (autoSpectate and "ON" or "OFF") spectateButton.Parent = sec1
+Instance.new("UICorner", spectateButton).CornerRadius = UDim.new(0, 4)
+
+local specOrbitOnlyButton = Instance.new("TextButton")
+specOrbitOnlyButton.Size = UDim2.new(0, 160, 0, 28) specOrbitOnlyButton.Position = UDim2.new(0, 170, 0, 32)
+specOrbitOnlyButton.BackgroundColor3 = SPECTATE_ON_ORBIT_ONLY and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+specOrbitOnlyButton.BackgroundTransparency = 0.2 specOrbitOnlyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+specOrbitOnlyButton.TextSize = 12 specOrbitOnlyButton.Font = Enum.Font.SourceSansBold
+specOrbitOnlyButton.Text = "Spec on Orbit: " .. (SPECTATE_ON_ORBIT_ONLY and "ON" or "OFF") specOrbitOnlyButton.Parent = sec1
+Instance.new("UICorner", specOrbitOnlyButton).CornerRadius = UDim.new(0, 4)
+
+local flipButton = Instance.new("TextButton")
+flipButton.Size = UDim2.new(0, 160, 0, 28) flipButton.Position = UDim2.new(0, 0, 0, 64)
+flipButton.BackgroundColor3 = isUpsideDown and Color3.fromRGB(200, 120, 50) or Color3.fromRGB(80, 80, 80)
+flipButton.BackgroundTransparency = 0.2 flipButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+flipButton.TextSize = 12 flipButton.Font = Enum.Font.SourceSansBold
+flipButton.Text = "Upside Down: " .. (isUpsideDown and "ON" or "OFF") flipButton.Parent = sec1
+Instance.new("UICorner", flipButton).CornerRadius = UDim.new(0, 4)
+
+local camModeButton = Instance.new("TextButton")
+camModeButton.Size = UDim2.new(0, 160, 0, 28) camModeButton.Position = UDim2.new(0, 170, 0, 64)
+camModeButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80) camModeButton.BackgroundTransparency = 0.2
+camModeButton.TextColor3 = Color3.fromRGB(255, 255, 255) camModeButton.TextSize = 12 camModeButton.Font = Enum.Font.SourceSansBold
+camModeButton.Text = "Cam Mode: Instant" camModeButton.Parent = sec1
+Instance.new("UICorner", camModeButton).CornerRadius = UDim.new(0, 4)
+
+local espToggleButton = Instance.new("TextButton")
+espToggleButton.Size = UDim2.new(0, 160, 0, 28) espToggleButton.Position = UDim2.new(0, 0, 0, 96)
+espToggleButton.BackgroundColor3 = ESP_SETTINGS.enabled and Color3.fromRGB(50, 180, 50) or Color3.fromRGB(180, 50, 50)
+espToggleButton.BackgroundTransparency = 0.2 espToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+espToggleButton.TextSize = 12 espToggleButton.Font = Enum.Font.SourceSansBold
+espToggleButton.Text = "ESP: " .. (ESP_SETTINGS.enabled and "ON" or "OFF") espToggleButton.Parent = sec1
+Instance.new("UICorner", espToggleButton).CornerRadius = UDim.new(0, 4)
+
+local espModeButton = Instance.new("TextButton")
+espModeButton.Size = UDim2.new(0, 160, 0, 28) espModeButton.Position = UDim2.new(0, 170, 0, 96)
+espModeButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200) espModeButton.BackgroundTransparency = 0.2
+espModeButton.TextColor3 = Color3.fromRGB(255, 255, 255) espModeButton.TextSize = 12 espModeButton.Font = Enum.Font.SourceSansBold
+espModeButton.Text = "ESP Target: All" espModeButton.Parent = sec1
+Instance.new("UICorner", espModeButton).CornerRadius = UDim.new(0, 4)
+
+local deathTweenButton = Instance.new("TextButton")
+deathTweenButton.Size = UDim2.new(0, 330, 0, 26) deathTweenButton.Position = UDim2.new(0, 0, 0, 128)
+deathTweenButton.BackgroundColor3 = tweenOnTargetDeath and Color3.fromRGB(150, 50, 200) or Color3.fromRGB(80, 80, 80)
+deathTweenButton.BackgroundTransparency = 0.2 deathTweenButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+deathTweenButton.TextSize = 12 deathTweenButton.Font = Enum.Font.SourceSansBold
+deathTweenButton.Text = "Ascend on Target Death: " .. (tweenOnTargetDeath and "ON" or "OFF") deathTweenButton.Parent = sec1
+Instance.new("UICorner", deathTweenButton).CornerRadius = UDim.new(0, 4)
+
+local relockButton = Instance.new("TextButton")
+relockButton.Size = UDim2.new(0, 330, 0, 26) relockButton.Position = UDim2.new(0, 0, 0, 158)
+relockButton.BackgroundColor3 = relockOnRespawn and Color3.fromRGB(50, 180, 120) or Color3.fromRGB(80, 80, 80)
+relockButton.BackgroundTransparency = 0.2 relockButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+relockButton.TextSize = 12 relockButton.Font = Enum.Font.SourceSansBold
+relockButton.Text = "Re-lock Target on Respawn: " .. (relockOnRespawn and "ON" or "OFF") relockButton.Parent = sec1
+Instance.new("UICorner", relockButton).CornerRadius = UDim.new(0, 4)
+
+local instantTargetButton = Instance.new("TextButton")
+instantTargetButton.Size = UDim2.new(0, 330, 0, 26) instantTargetButton.Position = UDim2.new(0, 0, 0, 188)
+instantTargetButton.BackgroundColor3 = INSTANT_TARGET_ON_ORBIT and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+instantTargetButton.BackgroundTransparency = 0.2 instantTargetButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+instantTargetButton.TextSize = 12 instantTargetButton.Font = Enum.Font.SourceSansBold
+instantTargetButton.Text = "Instant Target on Orbit: " .. (INSTANT_TARGET_ON_ORBIT and "ON" or "OFF") instantTargetButton.Parent = sec1
+Instance.new("UICorner", instantTargetButton).CornerRadius = UDim.new(0, 4)
+
+local camLockKeyButton = Instance.new("TextButton")
+camLockKeyButton.Size = UDim2.new(0, 330, 0, 26) camLockKeyButton.Position = UDim2.new(0, 0, 0, 218)
+camLockKeyButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60) camLockKeyButton.BackgroundTransparency = 0.2
+camLockKeyButton.TextColor3 = Color3.fromRGB(255, 255, 255) camLockKeyButton.TextSize = 12 camLockKeyButton.Font = Enum.Font.SourceSansBold
+camLockKeyButton.Text = "Cam Lock Key: [None]" camLockKeyButton.Parent = sec1
+Instance.new("UICorner", camLockKeyButton).CornerRadius = UDim.new(0, 4)
+
+
+-- Section 2: Troll Mechanics
+local sec2 = makeCollapsibleSection("Troll Mechanics", 312, 60)
+
+local frontflipBtn = Instance.new("TextButton")
+frontflipBtn.Size = UDim2.new(0, 160, 0, 26) frontflipBtn.Position = UDim2.new(0, 0, 0, 0)
+frontflipBtn.BackgroundColor3 = Color3.fromRGB(180, 100, 30) frontflipBtn.BackgroundTransparency = 0.2
+frontflipBtn.TextColor3 = Color3.fromRGB(255, 255, 255) frontflipBtn.TextSize = 11 frontflipBtn.Font = Enum.Font.SourceSansBold
+frontflipBtn.Text = "Frontflip (Z)" frontflipBtn.Parent = sec2
+Instance.new("UICorner", frontflipBtn).CornerRadius = UDim.new(0, 4)
+
+local backflipBtn = Instance.new("TextButton")
+backflipBtn.Size = UDim2.new(0, 160, 0, 26) backflipBtn.Position = UDim2.new(0, 170, 0, 0)
+backflipBtn.BackgroundColor3 = Color3.fromRGB(180, 100, 30) backflipBtn.BackgroundTransparency = 0.2
+backflipBtn.TextColor3 = Color3.fromRGB(255, 255, 255) backflipBtn.TextSize = 11 backflipBtn.Font = Enum.Font.SourceSansBold
+backflipBtn.Text = "Backflip (X)" backflipBtn.Parent = sec2
+Instance.new("UICorner", backflipBtn).CornerRadius = UDim.new(0, 4)
+
+local backflipModeBtn = Instance.new("TextButton")
+backflipModeBtn.Size = UDim2.new(0, 330, 0, 26) backflipModeBtn.Position = UDim2.new(0, 0, 0, 32)
+backflipModeBtn.BackgroundColor3 = backflipModeActive and Color3.fromRGB(50, 180, 120) or Color3.fromRGB(80, 80, 80)
+backflipModeBtn.BackgroundTransparency = 0.2 backflipModeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+backflipModeBtn.TextSize = 11 backflipModeBtn.Font = Enum.Font.SourceSansBold
+backflipModeBtn.Text = "Backflip Mode (Jump): " .. (backflipModeActive and "ON" or "OFF") backflipModeBtn.Parent = sec2
+Instance.new("UICorner", backflipModeBtn).CornerRadius = UDim.new(0, 4)
+
+frontflipBtn.MouseButton1Click:Connect(doFrontflip)
+backflipBtn.MouseButton1Click:Connect(doBackflip)
+backflipModeBtn.MouseButton1Click:Connect(function()
+    backflipModeActive = not backflipModeActive
+    backflipModeBtn.BackgroundColor3 = backflipModeActive and Color3.fromRGB(50, 180, 120) or Color3.fromRGB(80, 80, 80)
+    backflipModeBtn.Text = "Backflip Mode (Jump): " .. (backflipModeActive and "ON" or "OFF")
+end)
+
+
+-- Section 3: Movement & Speed Settings
+local sec3 = makeCollapsibleSection("Orbit Heights & Speeds", 385, 60)
+
+local goUpButton = Instance.new("TextButton")
+goUpButton.Size = UDim2.new(0, 160, 0, 26) goUpButton.Position = UDim2.new(0, 0, 0, 0)
+goUpButton.BackgroundColor3 = Color3.fromRGB(90, 50, 180) goUpButton.BackgroundTransparency = 0.2
+goUpButton.TextColor3 = Color3.fromRGB(255, 255, 255) goUpButton.TextSize = 12 goUpButton.Font = Enum.Font.SourceSansBold
+goUpButton.Text = "Orbit Height UP (J)" goUpButton.Parent = sec3
+Instance.new("UICorner", goUpButton).CornerRadius = UDim.new(0, 4)
+
+local goDownButton = Instance.new("TextButton")
+goDownButton.Size = UDim2.new(0, 160, 0, 26) goDownButton.Position = UDim2.new(0, 170, 0, 0)
+goDownButton.BackgroundColor3 = Color3.fromRGB(150, 50, 180) goDownButton.BackgroundTransparency = 0.2
+goDownButton.TextColor3 = Color3.fromRGB(255, 255, 255) goDownButton.TextSize = 12 goDownButton.Font = Enum.Font.SourceSansBold
+goDownButton.Text = "Orbit Height DOWN (K)" goDownButton.Parent = sec3
+Instance.new("UICorner", goDownButton).CornerRadius = UDim.new(0, 4)
+
+local flySpeedLabel = Instance.new("TextLabel")
+flySpeedLabel.Size = UDim2.new(0, 80, 0, 22) flySpeedLabel.Position = UDim2.new(0, 0, 0, 32)
+flySpeedLabel.BackgroundTransparency = 1 flySpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+flySpeedLabel.TextSize = 11 flySpeedLabel.Font = Enum.Font.SourceSans flySpeedLabel.Text = "Flight Speed:" flySpeedLabel.Parent = sec3
+
+local flySpeedInput = Instance.new("TextBox")
+flySpeedInput.Size = UDim2.new(0, 80, 0, 22) flySpeedInput.Position = UDim2.new(0, 80, 0, 32)
+flySpeedInput.BackgroundColor3 = Color3.fromRGB(30, 30, 30) flySpeedInput.BackgroundTransparency = 0.4
+flySpeedInput.TextColor3 = Color3.fromRGB(255, 255, 255) flySpeedInput.TextSize = 12 flySpeedInput.Font = Enum.Font.SourceSansBold
+flySpeedInput.Text = tostring(FLY_SPEED) flySpeedInput.ClearTextOnFocus = false flySpeedInput.Parent = sec3
+Instance.new("UICorner", flySpeedInput).CornerRadius = UDim.new(0, 4)
+
+local orbitSpeedLabel = Instance.new("TextLabel")
+orbitSpeedLabel.Size = UDim2.new(0, 80, 0, 22) orbitSpeedLabel.Position = UDim2.new(0, 170, 0, 32)
+orbitSpeedLabel.BackgroundTransparency = 1 orbitSpeedLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+orbitSpeedLabel.TextSize = 11 orbitSpeedLabel.Font = Enum.Font.SourceSans orbitSpeedLabel.Text = "Spin Speed:" orbitSpeedLabel.Parent = sec3
+
+local orbitSpeedInput = Instance.new("TextBox")
+orbitSpeedInput.Size = UDim2.new(0, 80, 0, 22) orbitSpeedInput.Position = UDim2.new(0, 250, 0, 32)
+orbitSpeedInput.BackgroundColor3 = Color3.fromRGB(30, 30, 30) orbitSpeedInput.BackgroundTransparency = 0.4
+orbitSpeedInput.TextColor3 = Color3.fromRGB(255, 255, 255) orbitSpeedInput.TextSize = 12 orbitSpeedInput.Font = Enum.Font.SourceSansBold
+orbitSpeedInput.Text = tostring(ORBIT_SPEED) orbitSpeedInput.ClearTextOnFocus = false orbitSpeedInput.Parent = sec3
+Instance.new("UICorner", orbitSpeedInput).CornerRadius = UDim.new(0, 4)
+
+
+-- Section 4: Live Player List
+local sec4 = makeCollapsibleSection("Player List (Target / Live Ping)", 458, 200)
+
+local scrollList = Instance.new("ScrollingFrame")
+scrollList.Size = UDim2.new(1, 0, 0, 195)
+scrollList.Position = UDim2.new(0, 0, 0, 0)
+scrollList.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+scrollList.BackgroundTransparency = 0.6
+scrollList.BorderSizePixel = 0
+scrollList.CanvasSize = UDim2.new(0, 0, 0, 0)
+scrollList.ScrollBarThickness = 4
+scrollList.Parent = sec4
+Instance.new("UICorner", scrollList).CornerRadius = UDim.new(0, 4)
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 3)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = scrollList
+
+
+--------------------------------------------------------------------------------
+-- MASSIVELY EXPANDED ADMIN CONTROL PANEL MENU
+--------------------------------------------------------------------------------
+if isAdmin then
+    local adminFrame = Instance.new("Frame")
+    adminFrame.Name = "AdminControlPanel"
+    adminFrame.Size = UDim2.new(0, 240, 0, 460)
+    adminFrame.Position = UDim2.new(0, 400, 0.5, -230)
+    adminFrame.BackgroundColor3 = Color3.fromRGB(20, 15, 25)
+    adminFrame.BackgroundTransparency = 0.25
+    adminFrame.BorderSizePixel = 0
+    adminFrame.Parent = screenGui
+    Instance.new("UICorner", adminFrame).CornerRadius = UDim.new(0, 8)
+
+    local aHeader = Instance.new("TextButton")
+    aHeader.Size = UDim2.new(1, -10, 0, 25)
+    aHeader.Position = UDim2.new(0, 5, 0, 5)
+    aHeader.BackgroundColor3 = Color3.fromRGB(35, 25, 45)
+    aHeader.TextColor3 = Color3.fromRGB(255, 80, 80)
+    aHeader.TextSize = 12
+    aHeader.Font = Enum.Font.SourceSansBold
+    aHeader.Text = "[ - ] EXPANDED ADMIN PANEL"
+    aHeader.Parent = adminFrame
+    Instance.new("UICorner", aHeader).CornerRadius = UDim.new(0, 4)
+
+    local aContainer = Instance.new("ScrollingFrame")
+    aContainer.Size = UDim2.new(1, 0, 0, 420)
+    aContainer.Position = UDim2.new(0, 0, 0, 32)
+    aContainer.BackgroundTransparency = 1
+    aContainer.CanvasSize = UDim2.new(0, 0, 0, 390)
+    aContainer.ScrollBarThickness = 3
+    aContainer.Parent = aHeader
+
+    local isOpenAdmin = true
+    aHeader.MouseButton1Click:Connect(function()
+        isOpenAdmin = not isOpenAdmin
+        aContainer.Visible = isOpenAdmin
+        aHeader.Text = (isOpenAdmin and "[ - ] " or "[ + ] ") .. "EXPANDED ADMIN PANEL"
+    end)
+
+    local selectedAdminTarget = "all"
+
+    local targetInput = Instance.new("TextBox")
+    targetInput.Size = UDim2.new(1, -20, 0, 24)
+    targetInput.Position = UDim2.new(0, 10, 0, 5)
+    targetInput.BackgroundColor3 = Color3.fromRGB(35, 30, 45)
+    targetInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+    targetInput.TextSize = 11
+    targetInput.Font = Enum.Font.SourceSans
+    targetInput.Text = "Target: ALL (Type Name)"
+    targetInput.Parent = aContainer
+    Instance.new("UICorner", targetInput).CornerRadius = UDim.new(0, 4)
+
+    targetInput.FocusLost:Connect(function()
+        if targetInput.Text ~= "" and targetInput.Text ~= "Target: ALL (Type Name)" then
+            selectedAdminTarget = targetInput.Text
+        else
+            selectedAdminTarget = "all"
+            targetInput.Text = "Target: ALL (Type Name)"
+        end
+    end)
+
+    local function createAdminBtn(txt, posY, color, cmdSuffix)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -20, 0, 25)
+        btn.Position = UDim2.new(0, 10, 0, posY)
+        btn.BackgroundColor3 = color
+        btn.BackgroundTransparency = 0.2
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 11
+        btn.Font = Enum.Font.SourceSansBold
+        btn.Text = txt
+        btn.Parent = aContainer
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+        btn.MouseButton1Click:Connect(function()
+            sendAdminSignal("cmd:" .. selectedAdminTarget:lower() .. ":" .. cmdSuffix)
+        end)
+    end
+
+    createAdminBtn("Force Flight ON", 35, Color3.fromRGB(50, 150, 80), "fly_on")
+    createAdminBtn("Force Flight OFF", 65, Color3.fromRGB(150, 50, 50), "fly_off")
+    createAdminBtn("Force Orbit ON", 95, Color3.fromRGB(50, 120, 180), "orbit_on")
+    createAdminBtn("Force Orbit OFF", 125, Color3.fromRGB(150, 80, 50), "orbit_off")
+    createAdminBtn("Force Frontflip", 155, Color3.fromRGB(160, 100, 40), "flip_front")
+    createAdminBtn("Force Backflip", 185, Color3.fromRGB(160, 100, 40), "flip_back")
+    createAdminBtn("Set WalkSpeed to 100", 215, Color3.fromRGB(120, 60, 180), "speed:100")
+    createAdminBtn("Set JumpPower to 150", 245, Color3.fromRGB(120, 60, 180), "jumppower:150")
+    createAdminBtn("Low Gravity (Gravity: 50)", 275, Color3.fromRGB(90, 140, 180), "gravity:50")
+    createAdminBtn("Normal Gravity (Gravity: 196)", 305, Color3.fromRGB(90, 140, 180), "gravity:196")
+    createAdminBtn("Force Sit", 335, Color3.fromRGB(180, 140, 40), "sit")
+    createAdminBtn("Force Unsit", 365, Color3.fromRGB(180, 140, 40), "unsit")
+    createAdminBtn("Noclip ON", 395, Color3.fromRGB(50, 160, 120), "noclip_on")
+    createAdminBtn("Noclip OFF", 425, Color3.fromRGB(160, 50, 80), "noclip_off")
+    createAdminBtn("Invisible ON", 455, Color3.fromRGB(100, 100, 180), "invisible_on")
+    createAdminBtn("Invisible OFF", 485, Color3.fromRGB(100, 100, 180), "invisible_off")
+    createAdminBtn("Fling Loop ON", 515, Color3.fromRGB(200, 80, 40), "fling_on")
+    createAdminBtn("Fling Loop OFF", 545, Color3.fromRGB(80, 80, 80), "fling_off")
+    createAdminBtn("Remote Self-Destruct / Kill", 575, Color3.fromRGB(200, 30, 30), "kill")
+    
+    aContainer.CanvasSize = UDim2.new(0, 0, 0, 610)
+end
+
+--------------------------------------------------------------------------------
+-- DRAWING API CLEAN 2D FLAT ESP
+--------------------------------------------------------------------------------
+local espCache = {}
+
+local function createEsp(p)
+    local drawings = {}
+    drawings.boxoutline = newDrawing("Square") drawings.boxoutline.Thickness = 3 drawings.boxoutline.Filled = false drawings.boxoutline.Color = newColor3(0, 0, 0) drawings.boxoutline.Visible = false drawings.boxoutline.ZIndex = 1
+    drawings.box = newDrawing("Square") drawings.box.Thickness = 1 drawings.box.Filled = false drawings.box.Color = ESP_SETTINGS.defaultcolor drawings.box.Visible = false drawings.box.ZIndex = 2
+    drawings.healthoutline = newDrawing("Square") drawings.healthoutline.Thickness = 1 drawings.healthoutline.Filled = true drawings.healthoutline.Color = newColor3(0, 0, 0) drawings.healthoutline.Visible = false drawings.healthoutline.ZIndex = 1
+    drawings.healthbar = newDrawing("Square") drawings.healthbar.Thickness = 1 drawings.healthbar.Filled = true drawings.healthbar.Color = newColor3(0, 255, 0) drawings.healthbar.Visible = false drawings.healthbar.ZIndex = 2
+    drawings.nametag = newDrawing("Text") drawings.nametag.Size = 13 drawings.nametag.Center = true drawings.nametag.Outline = true drawings.nametag.Color = newColor3(1, 1, 1) drawings.nametag.Visible = false drawings.nametag.ZIndex = 3
+    espCache[p] = drawings
+end
+
+local function removeEsp(p)
+    if rawget(espCache, p) then
+        for _, drawing in next, espCache[p] do drawing:Remove() end
+        espCache[p] = nil
+    end
+end
+
+local function updateEsp(p, esp)
+    local character = p and p.Character
+    local hrp = character and character:FindFirstChild("HumanoidRootPart")
+    local head = character and character:FindFirstChild("Head")
+    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+    if ESP_SETTINGS.enabled and character and hrp and head and humanoid and humanoid.Health > 0 then
+        if ESP_SETTINGS.mode == "Target" and currentTarget ~= p then
+            esp.box.Visible = false esp.boxoutline.Visible = false esp.healthbar.Visible = false esp.healthoutline.Visible = false esp.nametag.Visible = false
+            return
+        end
+
+        local distance = (camera.CFrame.Position - hrp.Position).Magnitude
+        if distance > ESP_SETTINGS.maxdistance then
+            esp.box.Visible = false esp.boxoutline.Visible = false esp.healthbar.Visible = false esp.healthoutline.Visible = false esp.nametag.Visible = false
+            return
+        end
+
+        local topWorld = head.Position + Vector3.new(0, 0.8, 0)
+        local bottomWorld = hrp.Position - Vector3.new(0, 3.2, 0)
+
+        local topPos, topOnScreen = camera:WorldToViewportPoint(topWorld)
+        local bottomPos, bottomOnScreen = camera:WorldToViewportPoint(bottomWorld)
+
+        if (topOnScreen or bottomOnScreen) and topPos.Z > 0 and bottomPos.Z > 0 then
+            local boxHeight = math.abs(bottomPos.Y - topPos.Y)
+            local boxWidth = boxHeight * 0.55
+            local x = topPos.X - (boxWidth / 2)
+            local y = topPos.Y
+
+            local color = ESP_SETTINGS.teamcolor and p.TeamColor.Color or ESP_SETTINGS.defaultcolor
+            if p.Team == localPlayer.Team then color = ESP_SETTINGS.allycolor end
+
+            esp.box.Size = newVector2(boxWidth, boxHeight) esp.box.Position = newVector2(x, y) esp.box.Color = color esp.box.Visible = true
+            esp.boxoutline.Size = esp.box.Size esp.boxoutline.Position = esp.box.Position esp.boxoutline.Visible = true
+
+            if ESP_SETTINGS.showhealth then
+                local healthPercent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
+                local barHeight = boxHeight * healthPercent
+                esp.healthoutline.Size = newVector2(3, boxHeight + 2) esp.healthoutline.Position = newVector2(x - 6, y - 1) esp.healthoutline.Visible = true
+                esp.healthbar.Size = newVector2(1, barHeight) esp.healthbar.Position = newVector2(x - 5, y + (boxHeight - barHeight)) esp.healthbar.Color = Color3.fromRGB(255 - (healthPercent * 255), healthPercent * 255, 0) esp.healthbar.Visible = true
+            else
+                esp.healthbar.Visible = false esp.healthoutline.Visible = false
+            end
+
+            if ESP_SETTINGS.showname then
+                esp.nametag.Text = p.DisplayName .. " [" .. math.floor(distance) .. "m]"
+                esp.nametag.Position = newVector2(topPos.X, y - 18) esp.nametag.Visible = true
+            else
+                esp.nametag.Visible = false
+            end
+        else
+            esp.box.Visible = false esp.boxoutline.Visible = false esp.healthbar.Visible = false esp.healthoutline.Visible = false esp.nametag.Visible = false
+        end
+    else
+        esp.box.Visible = false esp.boxoutline.Visible = false esp.healthbar.Visible = false esp.healthoutline.Visible = false esp.nametag.Visible = false
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do if p ~= localPlayer then createEsp(p) end end
+Players.PlayerAdded:Connect(function(p) if p ~= localPlayer then createEsp(p) end end)
+Players.PlayerRemoving:Connect(function(p) removeEsp(p) end)
+
+--------------------------------------------------------------------------------
+-- FORWARD DECLARATIONS & CAMERA LOGIC
+--------------------------------------------------------------------------------
+local selectTarget, stopOrbiting, startOrbiting, resetCamera, setCameraTarget, stopCamLock, startCamLock
+
+resetCamera = function()
+    if localPlayer.Character and localPlayer.Character:FindFirstChild("Humanoid") then
+        camera.CameraSubject = localPlayer.Character:FindFirstChild("Humanoid")
+    end
+end
+
+setCameraTarget = function(targetPlayer)
+    local shouldSpectate = autoSpectate and (not SPECTATE_ON_ORBIT_ONLY or isOrbiting)
+    if shouldSpectate and targetPlayer and targetPlayer.Character then
+        local targetHum = targetPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if targetHum then camera.CameraSubject = targetHum end
+    end
+end
+
+local function getClosestPlayerForCamLock()
+    local character = localPlayer.Character
+    if not character or not character:FindFirstChild("HumanoidRootPart") then return nil end
+    local closestPlayer = nil
+    local shortestDistance = MAX_CAM_LOCK_DISTANCE
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= localPlayer and otherPlayer.Character then
+            local targetHRP = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local targetHumanoid = otherPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if targetHRP and targetHumanoid and targetHumanoid.Health > 0 then
+                local distance = (character.HumanoidRootPart.Position - targetHRP.Position).Magnitude
+                if distance < shortestDistance then shortestDistance = distance closestPlayer = otherPlayer end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+stopCamLock = function()
+    isCamLocked = false
+    if camLockConnection then camLockConnection:Disconnect() camLockConnection = nil end
+end
+
+startCamLock = function()
+    local target = getClosestPlayerForCamLock()
+    if not target then return end
+    isCamLocked = true
+    camLockConnection = RunService.RenderStepped:Connect(function()
+        if not isCamLocked or not target.Character then stopCamLock() return end
+        local targetHRP = target.Character:FindFirstChild("HumanoidRootPart")
+        local targetHumanoid = target.Character:FindFirstChildOfClass("Humanoid")
+        if not targetHRP or not targetHumanoid or targetHumanoid.Health <= 0 then stopCamLock() return end
+        camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetHRP.Position)
+    end)
+end
+
+local function handleCharacterAdded(p)
+    p.CharacterAdded:Connect(function(newChar)
+        task.wait(0.5)
+        if currentTarget == p and relockOnRespawn and isScriptActive then
+            statusLabel.Text = "Locked Target: " .. p.DisplayName
+            setCameraTarget(p)
+            if isOrbiting then startOrbiting() end
+        end
+    end)
+end
+
+for _, p in ipairs(Players:GetPlayers()) do handleCharacterAdded(p) end
+Players.PlayerAdded:Connect(handleCharacterAdded)
+
+RunService.RenderStepped:Connect(function(dt)
+    if not isScriptActive then return end
+    local shouldSpectate = autoSpectate and (not SPECTATE_ON_ORBIT_ONLY or isOrbiting)
+    if (isOrbiting or (shouldSpectate and currentTarget)) and not isCamLocked then
+        if CAMERA_MODE == "Smooth" then
+            local targetCF = camera.CFrame
+            smoothedCameraCFrame = smoothedCameraCFrame:Lerp(targetCF, math.clamp(dt * CAMERA_DELAY_SPEED, 0, 1))
+            camera.CFrame = smoothedCameraCFrame
+        elseif CAMERA_MODE == "Delayed" then
+            local targetCF = camera.CFrame
+            smoothedCameraCFrame = smoothedCameraCFrame:Lerp(targetCF, math.clamp(dt * (CAMERA_DELAY_SPEED * 0.5), 0, 1))
+            camera.CFrame = smoothedCameraCFrame
+        end
+    end
+
+    for p, drawings in next, espCache do
+        if ESP_SETTINGS.teamcheck and p.Team == localPlayer.Team then
+            drawings.box.Visible = false drawings.boxoutline.Visible = false drawings.healthbar.Visible = false drawings.healthoutline.Visible = false drawings.nametag.Visible = false
+            continue
+        end
+        if drawings and p ~= localPlayer then updateEsp(p, drawings) end
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- FLIGHT SYSTEM WITH DYNAMIC SPEED INPUT
+--------------------------------------------------------------------------------
+local function stopFlight()
+    isFlying = false
+    if flyConnection then flyConnection:Disconnect() flyConnection = nil end
+    local character = localPlayer.Character
+    if character and character:FindFirstChildOfClass("Humanoid") then character:FindFirstChildOfClass("Humanoid").PlatformStand = false end
+    if flyBodyVelocity then flyBodyVelocity:Destroy() flyBodyVelocity = nil end
+    if flyBodyGyro then flyBodyGyro:Destroy() flyBodyGyro = nil end
+    flyButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    flyButton.Text = "Flight: OFF (T)"
+end
+
+local function startFlying()
+    if not isScriptActive then return end
+    local character = localPlayer.Character
+    if not character then return end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not hrp or not humanoid then return end
+
+    isFlying = true
+    humanoid.PlatformStand = true
+    hrp.CFrame = hrp.CFrame + Vector3.new(0, FLY_START_HEIGHT, 0)
+
+    flyBodyVelocity = Instance.new("BodyVelocity") flyBodyVelocity.MaxForce = Vector3.new(math.huge, math.huge, math.huge) flyBodyVelocity.Velocity = Vector3.zero flyBodyVelocity.Parent = hrp
+    flyBodyGyro = Instance.new("BodyGyro") flyBodyGyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge) flyBodyGyro.P = 20000 flyBodyGyro.CFrame = hrp.CFrame flyBodyGyro.Parent = hrp
+
+    flyButton.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+    flyButton.Text = "Flight: ON (T)"
+
+    flyConnection = RunService.RenderStepped:Connect(function()
+        if not isScriptActive or not isFlying or not character or not hrp or not humanoid then stopFlight() return end
+        flyBodyGyro.CFrame = camera.CFrame
+        if isOrbiting then flyBodyVelocity.Velocity = Vector3.zero return end
+
+        local moveVector = Vector3.zero
+        local camCFrame = camera.CFrame
+        if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveVector = moveVector + camCFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveVector = moveVector - camCFrame.LookVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveVector = moveVector - camCFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveVector = moveVector + camCFrame.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveVector = moveVector + Vector3.new(0, 1, 0) end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then moveVector = moveVector + Vector3.new(0, -1, 0) end
+
+        if moveVector.Magnitude > 0 then flyBodyVelocity.Velocity = moveVector.Unit * FLY_SPEED else flyBodyVelocity.Velocity = Vector3.zero end
+    end)
+end
+
+local function toggleFlight()
+    if isFlying then stopFlight() else startFlying() end
+end
+
+flySpeedInput.FocusLost:Connect(function()
+    local val = tonumber(flySpeedInput.Text)
+    if val then FLY_SPEED = math.clamp(val, 10, 1000) flySpeedInput.Text = tostring(FLY_SPEED) else flySpeedInput.Text = tostring(FLY_SPEED) end
+end)
+
+--------------------------------------------------------------------------------
+-- ORBIT SYSTEM
+--------------------------------------------------------------------------------
+stopOrbiting = function(isTargetDead)
+    isOrbiting = false
+    if orbitConnection then orbitConnection:Disconnect() orbitConnection = nil end
+    orbitButton.BackgroundColor3 = Color3.fromRGB(180, 50, 50)
+    orbitButton.Text = "Orbit: OFF (N)"
+    verticalOffset = 0
+    resetCamera()
+
+    if isTargetDead and tweenOnTargetDeath then
+        local character = localPlayer.Character
+        local hrp = character and character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local tweenInfo = TweenInfo.new(1.2, Enum.EasingStyle.Cubic, Enum.EasingDirection.Out)
+            TweenService:Create(hrp, tweenInfo, {CFrame = hrp.CFrame + Vector3.new(0, 30, 0)}):Play()
+        end
+    end
+end
+
+local function getClosestPlayer()
+    local character = localPlayer.Character
+    if not character or not character:FindFirstChild("HumanoidRootPart") then return nil end
+    local closestPlayer = nil
+    local shortestDistance = math.huge
+    for _, otherPlayer in ipairs(Players:GetPlayers()) do
+        if otherPlayer ~= localPlayer and otherPlayer.Character then
+            local targetHRP = otherPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local targetHumanoid = otherPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if targetHRP and targetHumanoid and targetHumanoid.Health > 0 then
+                local distance = (character.HumanoidRootPart.Position - targetHRP.Position).Magnitude
+                if distance < shortestDistance then shortestDistance = distance closestPlayer = otherPlayer end
+            end
+        end
+    end
+    return closestPlayer
+end
+
+startOrbiting = function()
+    if not isScriptActive then return end
+    if not currentTarget and INSTANT_TARGET_ON_ORBIT then
+        local closest = getClosestPlayer()
+        if closest then selectTarget(closest) end
+    end
+
+    if not currentTarget or not currentTarget.Character then return end
+    local character = localPlayer.Character
+    local myHRP = character and character:FindFirstChild("HumanoidRootPart")
+    if not myHRP then return end
+
+    isOrbiting = true
+    angle = 0
+    verticalOffset = 0
+    orbitButton.BackgroundColor3 = Color3.fromRGB(50, 180, 50)
+    orbitButton.Text = "Orbit: ON (N)"
+
+    setCameraTarget(currentTarget)
+
+    orbitConnection = RunService.RenderStepped:Connect(function(deltaTime)
+        if not isScriptActive or not isOrbiting or not currentTarget or not currentTarget.Character then stopOrbiting(true) return end
+        local targetHRP = currentTarget.Character:FindFirstChild("HumanoidRootPart")
+        local targetHumanoid = currentTarget.Character:FindFirstChildOfClass("Humanoid")
+
+        if not targetHRP or not targetHumanoid or targetHumanoid.Health <= 0 or not myHRP then
+            if not relockOnRespawn then currentTarget = nil statusLabel.Text = "Locked Target: None" else statusLabel.Text = "Target Dead (Waiting Respawn...)" end
+            stopOrbiting(true)
+            return
+        end
+
+        angle = angle + (ORBIT_SPEED * deltaTime)
+        local offsetX = math.cos(angle) * ORBIT_RADIUS
+        local offsetZ = math.sin(angle) * ORBIT_RADIUS
+        local targetPos = targetHRP.Position
+        local newPosition = Vector3.new(targetPos.X + offsetX, targetPos.Y + verticalOffset, targetPos.Z + offsetZ)
+        local lookCFrame = CFrame.lookAt(newPosition, targetPos)
+
+        if isUpsideDown then myHRP.CFrame = lookCFrame * CFrame.Angles(0, 0, math.pi) else myHRP.CFrame = lookCFrame end
+    end)
+end
+
+selectTarget = function(targetPlayer)
+    if currentTarget == targetPlayer or targetPlayer == nil then
+        currentTarget = nil
+        statusLabel.Text = "Locked Target: None"
+        stopOrbiting(false)
+        resetCamera()
+    else
+        currentTarget = targetPlayer
+        statusLabel.Text = "Locked Target: " .. targetPlayer.DisplayName
+        if isOrbiting then stopOrbiting(false) startOrbiting() else setCameraTarget(currentTarget) end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- PLAYER LIST & PING SETUP
+--------------------------------------------------------------------------------
+local playerLabels = {}
+
+local function refreshPlayerList()
+    for _, child in ipairs(scrollList:GetChildren()) do if child:IsA("TextButton") then child:Destroy() end end
+    playerLabels = {}
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, -6, 0, 24)
+        btn.BackgroundColor3 = (p == localPlayer) and Color3.fromRGB(50, 50, 50) or Color3.fromRGB(30, 30, 30)
+        btn.BackgroundTransparency = 0.4 btn.TextColor3 = Color3.fromRGB(220, 220, 220)
+        btn.TextSize = 11 btn.Font = Enum.Font.SourceSans
+        btn.Text = "  " .. p.DisplayName .. " (@" .. p.Name .. ") | Ping: -- ms"
+        btn.TextXAlignment = Enum.TextXAlignment.Left btn.Parent = scrollList
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 3)
+
+        if p ~= localPlayer then btn.MouseButton1Click:Connect(function() selectTarget(p) end) end
+        playerLabels[p] = btn
+    end
+    scrollList.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
+end
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if not isScriptActive then break end
+        for p, btn in pairs(playerLabels) do
+            if p and p.Parent then
+                local ping = math.floor(p:GetNetworkPing() * 1000)
+                btn.Text = "  " .. p.DisplayName .. " (@" .. p.Name .. ") | Ping: " .. ping .. "ms"
+            end
+        end
+    end
+end)
+
+Players.PlayerAdded:Connect(refreshPlayerList)
+Players.PlayerRemoving:Connect(refreshPlayerList)
+refreshPlayerList()
+
+--------------------------------------------------------------------------------
+-- INPUT & EVENT BINDINGS
+--------------------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if not isScriptActive then return end
+
+    if isBindingCamLockKey then
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            if input.KeyCode == Enum.KeyCode.Backspace or input.KeyCode == Enum.KeyCode.Escape then
+                CAM_LOCK_KEY = Enum.KeyCode.Unknown camLockKeyButton.Text = "Cam Lock Key: [None]"
+            else
+                CAM_LOCK_KEY = input.KeyCode camLockKeyButton.Text = "Cam Lock Key: [" .. input.KeyCode.Name .. "]"
+            end
+            camLockKeyButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+            isBindingCamLockKey = false
+            return
+        end
+    end
+
+    if gameProcessed then return end
+
+    if input.KeyCode == FLY_TOGGLE_KEY then toggleFlight()
+    elseif input.KeyCode == ORBIT_TOGGLE_KEY then if isOrbiting then stopOrbiting(false) else startOrbiting() end
+    elseif input.KeyCode == TARGET_KEY then
+        if currentTarget then selectTarget(nil) else
+            local closest, shortestDist = nil, math.huge
+            local myChar = localPlayer.Character
+            if myChar and myChar:FindFirstChild("HumanoidRootPart") then
+                for _, other in ipairs(Players:GetPlayers()) do
+                    if other ~= localPlayer and other.Character and other.Character:FindFirstChild("HumanoidRootPart") then
+                        local hum = other.Character:FindFirstChildOfClass("Humanoid")
+                        if hum and hum.Health > 0 then
+                            local d = (myChar.HumanoidRootPart.Position - other.Character.HumanoidRootPart.Position).Magnitude
+                            if d < shortestDist then shortestDist = d closest = other end
+                        end
+                    end
+                end
+            end
+            if closest then selectTarget(closest) else statusLabel.Text = "No players found!" end
+        end
+    elseif input.KeyCode == CAM_LOCK_KEY and CAM_LOCK_KEY ~= Enum.KeyCode.Unknown then
+        if isCamLocked then stopCamLock() else startCamLock() end
+    elseif input.KeyCode == GO_UP_KEY and isOrbiting then verticalOffset = math.clamp(verticalOffset + HEIGHT_STEP, MIN_HEIGHT, MAX_HEIGHT)
+    elseif input.KeyCode == GO_DOWN_KEY and isOrbiting then verticalOffset = math.clamp(verticalOffset - HEIGHT_STEP, MIN_HEIGHT, MAX_HEIGHT) end
+end)
+
+flyButton.MouseButton1Click:Connect(toggleFlight)
+orbitButton.MouseButton1Click:Connect(function() if isOrbiting then stopOrbiting(false) else startOrbiting() end end)
+spectateButton.MouseButton1Click:Connect(function()
+    autoSpectate = not autoSpectate
+    spectateButton.BackgroundColor3 = autoSpectate and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+    spectateButton.Text = "Spectate: " .. (autoSpectate and "ON" or "OFF")
+    if autoSpectate and currentTarget then setCameraTarget(currentTarget) else resetCamera() end
+end)
+specOrbitOnlyButton.MouseButton1Click:Connect(function()
+    SPECTATE_ON_ORBIT_ONLY = not SPECTATE_ON_ORBIT_ONLY
+    specOrbitOnlyButton.BackgroundColor3 = SPECTATE_ON_ORBIT_ONLY and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+    specOrbitOnlyButton.Text = "Spec on Orbit: " .. (SPECTATE_ON_ORBIT_ONLY and "ON" or "OFF")
+end)
+flipButton.MouseButton1Click:Connect(function()
+    isUpsideDown = not isUpsideDown
+    flipButton.BackgroundColor3 = isUpsideDown and Color3.fromRGB(200, 120, 50) or Color3.fromRGB(80, 80, 80)
+    flipButton.Text = "Upside Down: " .. (isUpsideDown and "ON" or "OFF")
+end)
+espToggleButton.MouseButton1Click:Connect(function()
+    ESP_SETTINGS.enabled = not ESP_SETTINGS.enabled
+    espToggleButton.BackgroundColor3 = ESP_SETTINGS.enabled and Color3.fromRGB(50, 180, 50) or Color3.fromRGB(180, 50, 50)
+    espToggleButton.Text = "ESP: " .. (ESP_SETTINGS.enabled and "ON" or "OFF")
+end)
+espModeButton.MouseButton1Click:Connect(function()
+    if ESP_SETTINGS.mode == "All" then
+        ESP_SETTINGS.mode = "Target" espModeButton.BackgroundColor3 = Color3.fromRGB(180, 120, 50) espModeButton.Text = "ESP Target: Locked Only"
+    else
+        ESP_SETTINGS.mode = "All" espModeButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200) espModeButton.Text = "ESP Target: All"
+    end
+end)
+deathTweenButton.MouseButton1Click:Connect(function()
+    tweenOnTargetDeath = not tweenOnTargetDeath
+    deathTweenButton.BackgroundColor3 = tweenOnTargetDeath and Color3.fromRGB(150, 50, 200) or Color3.fromRGB(80, 80, 80)
+    deathTweenButton.Text = "Ascend on Target Death: " .. (tweenOnTargetDeath and "ON" or "OFF")
+end)
+relockButton.MouseButton1Click:Connect(function()
+    relockOnRespawn = not relockOnRespawn
+    relockButton.BackgroundColor3 = relockOnRespawn and Color3.fromRGB(50, 180, 120) or Color3.fromRGB(80, 80, 80)
+    relockButton.Text = "Re-lock Target on Respawn: " .. (relockOnRespawn and "ON" or "OFF")
+end)
+instantTargetButton.MouseButton1Click:Connect(function()
+    INSTANT_TARGET_ON_ORBIT = not INSTANT_TARGET_ON_ORBIT
+    instantTargetButton.BackgroundColor3 = INSTANT_TARGET_ON_ORBIT and Color3.fromRGB(50, 140, 200) or Color3.fromRGB(80, 80, 80)
+    instantTargetButton.Text = "Instant Target on Orbit: " .. (INSTANT_TARGET_ON_ORBIT and "ON" or "OFF")
+end)
+camLockKeyButton.MouseButton1Click:Connect(function()
+    isBindingCamLockKey = true
+    camLockKeyButton.Text = "Press Any Key... (Backspace to Reset)"
+    camLockKeyButton.BackgroundColor3 = Color3.fromRGB(200, 140, 40)
+end)
+
+localPlayer.CharacterRemoving:Connect(function()
+    stopFlight()
+    stopOrbiting(false)
+    stopCamLock()
+    currentTarget = nil
+    statusLabel.Text = "Locked Target: None"
+end)
